@@ -1,0 +1,3 @@
+rootutils
+tensorboard==2.12.3
+pillow
