@@ -43,6 +43,9 @@ class AdaLayerNormZero(nn.Module):
             nn.SiLU(),
             nn.Linear(time_embed_dim, 6 * dim)  # 6×dim: 3 layers × (scale, shift, gate)
         )
+        # === AdaLN-Zero 핵심: modulation과 gate를 제로에서 시작 ===
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, x, t_emb):
         """
@@ -177,34 +180,34 @@ class FlowDet(nn.Module):
         pred_objectness = self.objectness_header(x)
         return (pred_box, pred_objectness)
     
-    def train_step(model, optimizer, sampler, images, batch_size=1, num_boxes=50, device="cuda"):
-        model.train()
-        optimizer.zero_grad()
+    # def train_step(model, optimizer, sampler, images, batch_size=1, num_boxes=50, device="cuda"):
+    #     model.train()
+    #     optimizer.zero_grad()
 
-        # 1. 샘플링
-        x0, x1, t = sampler.sample(batch_size, num_boxes)
-        xt = sampler.sample_xt(x0, x1, t)
-        ut = sampler.compute_target_flow(x0, x1, t, xt)
+    #     # 1. 샘플링
+    #     x0, x1, t = sampler.sample(batch_size, num_boxes)
+    #     xt = sampler.sample_xt(x0, x1, t)
+    #     ut = sampler.compute_target_flow(x0, x1, t, xt)
 
-        # 2. 모델 forward
-        pred_box, pred_obj = model(images, xt, t)
+    #     # 2. 모델 forward
+    #     pred_box, pred_obj = model(images, xt, t)
 
-        # 3. Flow Matching Loss (rectified flow)
-        flow_loss = torch.mean((pred_box - ut) ** 2)
+    #     # 3. Flow Matching Loss (rectified flow)
+    #     flow_loss = torch.mean((pred_box - ut) ** 2)
 
-        # 4. Objectness Loss (focal-like, 간단 버전)
-        target_obj = torch.ones_like(pred_obj)
-        obj_loss = torch.mean((pred_obj - target_obj) ** 2)
+    #     # 4. Objectness Loss (focal-like, 간단 버전)
+    #     target_obj = torch.ones_like(pred_obj)
+    #     obj_loss = torch.mean((pred_obj - target_obj) ** 2)
 
-        total_loss = flow_loss + 0.1 * obj_loss
-        total_loss.backward()
-        optimizer.step()
+    #     total_loss = flow_loss + 0.1 * obj_loss
+    #     total_loss.backward()
+    #     optimizer.step()
 
-        return {
-            "total_loss": total_loss.item(),
-            "flow_loss": flow_loss.item(),
-            "obj_loss": obj_loss.item()
-        }
+    #     return {
+    #         "total_loss": total_loss.item(),
+    #         "flow_loss": flow_loss.item(),
+    #         "obj_loss": obj_loss.item()
+    #     }
     
     @torch.no_grad()
     def inference_euler(model, image, x0, steps=10, device="cuda"):
