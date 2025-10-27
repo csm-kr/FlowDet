@@ -1,3 +1,9 @@
 rootutils
 tensorboard==2.12.3
 pillow
+wget
+matplotlib
+configargparse
+einops
+torchmetrics
+termcolor

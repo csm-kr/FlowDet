@@ -47,6 +47,7 @@ def get_args_parser():
     )
     # parser.add_argument('--config', is_config_file=True, default='./configs/netmarble.yaml', help='config file path')
     # parser.add_argument('--dataset', type=str, default='netmarble', help='dataset name')
+    parser.add_argument('--root', type=str, default='/usr/src/data/voc', help='dataset root')
     parser.add_argument('--exp_name', type=str, default='flowdet_voc', help='experiment name')
     parser.add_argument('--epochs', type=int, default=50, help='training epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
@@ -59,38 +60,58 @@ def get_args_parser():
 #  Validation Function
 # =========================================================
 @torch.no_grad()
-def validate(model, criterion, sampler, val_loader, device="cuda"):
+def validate(model, sampler, val_loader, device="cuda"):
     model.eval()
     total_val_loss, total_iou = 0.0, 0.0
     count = 0
 
-    for batch_idx, (images, boxes, labels, info) in enumerate(tqdm(val_loader, desc="Validation")):
+    for batch_idx, (images, boxes, labels, masks) in enumerate(tqdm(val_loader, desc="Validation")):
         images = images.to(device)
+        masks = masks.to(device)
         B = images.size(0)
         N_pred = 50
 
-        # 샘플링
-        x0 = sampler.sample(B, N_pred)
-        pred_boxes = inference_euler(model, images, x0, steps=10, device=device)
+        # ---------------------------
+        # 1️⃣ GT boxes 변환 [0,1] → [-1,1]
+        # ---------------------------
+        x1 = boxes.to(device)
+        x1_ = sampler.preprocess(x1)
 
-        # GT 구성
-        max_gt = max(len(b) for b in boxes)
-        gt_boxes = torch.zeros((B, max_gt, 4), device=device)
-        gt_obj = torch.zeros((B, max_gt), device=device)
-        for i, b in enumerate(boxes):
-            L = len(b)
-            gt_boxes[i, :L] = b.to(device)
-            gt_obj[i, :L] = 1.0
+        # ---------------------------
+        # 2️⃣ 초기 샘플링 x0_ ∼ N(0,1)
+        # ---------------------------
+        x0_ = sampler.sample(B, N_pred)
 
-        # 로스 계산
-        outputs = {"pred_boxes": pred_boxes, "pred_objectness": torch.ones(B, N_pred, device=device)}
-        targets = {"boxes": gt_boxes, "objectness": gt_obj}
-        losses = criterion(outputs, targets)
-        total_val_loss += losses["loss_total"].item()
+        # ---------------------------
+        # 3️⃣ Euler 적분 기반 예측 ([-1,1] 공간)
+        # ---------------------------
+        pred_boxes_ = inference_euler(model, images, x0_, steps=10, device=device)
 
-        # IoU 계산 (batch 평균)
+        # ---------------------------
+        # 4️⃣ Flow loss 계산
+        # ---------------------------
+        ut = x1_ - x0_  # Target vector field
+        valid_mask = masks.unsqueeze(-1)  # [B, 50, 1]
+        diff = (pred_boxes_ - ut) * valid_mask
+        flow_loss = (diff ** 2).sum() / valid_mask.sum().clamp(min=1.0)
+        flow_loss /= 10
+        total_val_loss += flow_loss.item()
+
+        # ---------------------------
+        # 5️⃣ IoU 계산을 위한 복원 ([-1,1] → [0,1])
+        # ---------------------------
+        pred_boxes = sampler.preprocess(pred_boxes_, reverse=True)
+        gt_boxes = x1  # 이미 [0,1]
+
+        # ---------------------------
+        # 6️⃣ IoU 계산
+        # ---------------------------
         for i in range(B):
-            ious = box_iou(pred_boxes[i], gt_boxes[i][:len(boxes[i])])
+            valid_gt = gt_boxes[i][masks[i].bool()]  # 유효한 GT만
+            if valid_gt.numel() == 0:
+                continue
+
+            ious = box_iou(pred_boxes[i], valid_gt)
             total_iou += ious.max(dim=0).values.mean().item()
             count += 1
 
@@ -126,8 +147,11 @@ def train_main(args):
                                     std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = VOC_Dataset(root=r"D:\data\voc", split="train", download=False, transform=transform_train, visualization=False)
-    val_dataset = VOC_Dataset(root=r"D:\data\voc", split="test", download=False, transform=transform_val, visualization=False)
+    train_dataset = VOC_Dataset(root=args.root, split="train", download=False, transform=transform_train, visualization=False)
+    val_dataset = VOC_Dataset(root=args.root, split="test", download=False, transform=transform_val, visualization=False)
+    
+    # train_dataset = VOC_Dataset(root=r"D:\data\voc", split="train", download=False, transform=transform_train, visualization=False)
+    # val_dataset = VOC_Dataset(root=r"D:\data\voc", split="test", download=False, transform=transform_val, visualization=False)
 
     train_loader = DataLoader(train_dataset, batch_size=64, collate_fn=train_dataset.collate_fn, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=64, collate_fn=val_dataset.collate_fn, shuffle=False, num_workers=4, pin_memory=True)
@@ -136,8 +160,8 @@ def train_main(args):
     # Model, Loss, Optimizer
     # -------------------------------
     model = FlowDet().to(device)
-    matcher = HungarianMatcherDynamicK(cost_class=1, cost_bbox=2, cost_giou=1, topk=5)
-    criterion = FlowDetCriterion(matcher, weight_cls=1.0, weight_box=2.0)
+    # matcher = HungarianMatcherDynamicK(cost_class=1, cost_bbox=2, cost_giou=1, topk=2)
+    # criterion = FlowDetCriterion(matcher, weight_cls=1.0, weight_box=2.0)
     sampler = DistributionSampler(out_dim=4, device=device)
     optimizer = Adam(model.parameters(), lr=args.lr)
 
@@ -149,43 +173,37 @@ def train_main(args):
         model.train()
         epoch_loss = 0.0
 
-        for batch_idx, (images, boxes, labels) in enumerate(tqdm(train_loader, desc=f"[Epoch {epoch+1}/{args.epochs}]")):
+        for batch_idx, (images, boxes, labels, masks) in enumerate(tqdm(train_loader, desc=f"[Epoch {epoch+1}/{args.epochs}]")):
         # for batch_idx, (images, boxes, labels) in enumerate(tqdm(val_loader, desc=f"[Epoch {epoch+1}/{args.epochs}]")):
             images = images.to(device)
-            B = images.size(0)
+            masks = masks.to(device)
+            batch_size = B = images.size(0)
             N_pred = 50
 
-            # 샘플링
-            x0 = sampler.sample(B, N_pred)
-            t = sampler.sample_t(B)
+            x1 = boxes.to(device)             # [0,1]
+            x1_ = sampler.preprocess(x1)      # [0,1] → [-1,1]
+            x0_ = sampler.sample(B, N_pred)   # [-1,1] (Gaussian or uniform)
 
-            # Forward
-            pred_box, pred_objectness = model(images, x0, t)
+            t = torch.rand(B, device=device)
+            xt_ = (1 - t.view(-1,1,1)) * x0_ + t.view(-1,1,1) * x1_
+            vt, _ = model(images, xt_, t)
 
-            # GT 구성
-            max_gt = max(len(b) for b in boxes)
-            gt_boxes = torch.zeros((B, max_gt, 4), device=device)
-            gt_obj = torch.zeros((B, max_gt), device=device)
-            for i, b in enumerate(boxes):
-                L = len(b)
-                gt_boxes[i, :L] = b.to(device)
-                gt_obj[i, :L] = 1.0
+            ut = x1_ - x0_
 
-            outputs = {"pred_boxes": pred_box, "pred_objectness": pred_objectness.squeeze(-1)}
-            targets = {"boxes": gt_boxes, "objectness": gt_obj}
+            # mask 적용 (유효 박스만)
+            valid_mask = masks.unsqueeze(-1)   # [B, 50, 1]
+            diff = (vt - ut) * valid_mask      # invalid 위치는 0
 
-            # Loss
-            losses = criterion(outputs, targets)
-            total_loss = losses["loss_total"]
+            # loss 계산 (MSE)
+            flow_loss = (diff ** 2).sum() / valid_mask.sum().clamp(min=1.0)
+            total_loss = flow_loss
 
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
 
             # TensorBoard logging
-            writer.add_scalar("train/loss_total", losses["loss_total"], global_step)
-            writer.add_scalar("train/loss_cls", losses["loss_cls"], global_step)
-            writer.add_scalar("train/loss_box", losses["loss_box"], global_step)
+            writer.add_scalar("train/loss_total", total_loss, global_step)
             epoch_loss += total_loss.item()
             global_step += 1
 
@@ -195,7 +213,7 @@ def train_main(args):
         # -------------------------------
         # Validation (inference)
         # -------------------------------
-        avg_val_loss, avg_val_iou = validate(model, criterion, sampler, val_loader, device)
+        avg_val_loss, avg_val_iou = validate(model, sampler, val_loader, device)
         print(f"Validation Loss: {avg_val_loss:.4f}, IoU: {avg_val_iou:.4f}")
 
         writer.add_scalar("val/loss_total", avg_val_loss, epoch)

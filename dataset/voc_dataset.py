@@ -237,27 +237,74 @@ class VOC_Dataset(data.Dataset):
         return (np.array(boxes, dtype=np.float32),
                 np.array(labels, dtype=np.int64))
 
-    def collate_fn(self, batch):
+    # def collate_fn(self, batch):
+    #     """
+    #     :param batch: an iterable of N sets from __getitem__()
+    #     :return: a tensor of images, lists of varying-size tensors of bounding boxes, labels, and difficulties
+    #     """
+    #     images = list()
+    #     boxes = list()
+    #     labels = list()
+    #     info = list()
+
+    #     for b in batch:
+    #         images.append(b[0])
+    #         boxes.append(b[1])
+    #         labels.append(b[2])
+    #         if self.split == "test":
+    #             info.append(b[3])
+
+    #     images = torch.stack(images, dim=0)
+    #     if self.split == "test":
+    #         return images, boxes, labels # , info
+    #     return images, boxes, labels
+
+
+    def collate_fn(self, batch, max_boxes=50):
         """
-        :param batch: an iterable of N sets from __getitem__()
-        :return: a tensor of images, lists of varying-size tensors of bounding boxes, labels, and difficulties
+        Detection용 collate_fn
+        - variable-length boxes를 [B, max_boxes, 4]로 패딩
+        - mask: [B, max_boxes] (1=유효, 0=패딩)
         """
-        images = list()
-        boxes = list()
-        labels = list()
-        info = list()
+        images = []
+        boxes = []
+        labels = []
+        masks = []
+        info = []
 
         for b in batch:
-            images.append(b[0])
-            boxes.append(b[1])
-            labels.append(b[2])
+            img, box, label = b[0], b[1], b[2]
             if self.split == "test":
-                info.append(b[3])
+                inf = b[3]
+                info.append(inf)
 
-        images = torch.stack(images, dim=0)
+            # --- box 패딩 ---
+            num_boxes = len(box)
+            if num_boxes > max_boxes:
+                # 너무 많으면 잘라냄
+                box = box[:max_boxes]
+                num_boxes = max_boxes
+
+            padded_box = torch.zeros((max_boxes, 4), dtype=torch.float32)
+            padded_box[:num_boxes] = box
+
+            mask = torch.zeros(max_boxes, dtype=torch.float32)
+            mask[:num_boxes] = 1.0  # 존재하는 박스만 1
+
+            images.append(img)
+            boxes.append(padded_box)
+            labels.append(label)
+            masks.append(mask)
+
+        images = torch.stack(images, dim=0)       # [B, 3, H, W]
+        boxes = torch.stack(boxes, dim=0)         # [B, max_boxes, 4]
+        masks = torch.stack(masks, dim=0)         # [B, max_boxes]
+
         if self.split == "test":
-            return images, boxes, labels, info
-        return images, boxes, labels
+            return images, boxes, labels, masks # , info
+        else:
+            return images, boxes, labels, masks
+
 
 
 if __name__ == "__main__":
@@ -268,9 +315,10 @@ if __name__ == "__main__":
     # train_transform
     # ubuntu_root = "/home/cvmlserver3/Sungmin/data/voc"
     window_root = 'D:\data\\voc'
+    ubuntu_root = "/usr/src/data/voc"
     # for test
     # window_root = r'C:\Users\csm81\Desktop\\voc_temp'
-    root = window_root
+    root = ubuntu_root
 
     transform_train = det_transforms.DetCompose([
         # ------------- for Tensor augmentation -------------
@@ -294,7 +342,7 @@ if __name__ == "__main__":
 
     train_set = VOC_Dataset(root,
                             split='test',
-                            download=False,
+                            download=True,
                             transform=transform_train,
                             visualization=True)
 
